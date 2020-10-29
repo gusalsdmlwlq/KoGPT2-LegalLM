@@ -87,19 +87,19 @@ def init_process(local_rank, backend, config):
     validate.max_iter = len(list(reader.make_batch("dev")))
     global_epoch = 0
 
-    max_score = 0
+    min_loss = 1e+9
     lr = config.lr
     early_stop_count = config.early_stop_count
 
     if config.save_path is not None:
-        step, epoch, score = load(model, optimizer, config.save_path, local_rank, config)
+        step, epoch, loss = load(model, optimizer, config.save_path, local_rank, config)
         train.global_step = step
         global_epoch = epoch
-        max_score = score
+        min_loss = loss
 
     logger.info("Validate...")
-    score = validate(model, reader, config, local_rank)
-    logger.info("BLEU: {:.4f}".format(score))
+    loss = validate(model, reader, config, local_rank)
+    logger.info("Loss: {:.4f}".format(loss))
 
     model.train()
 
@@ -108,27 +108,27 @@ def init_process(local_rank, backend, config):
         start = time.time()
 
         if local_rank == 0:
-            train(model, reader, optimizer, config, local_rank, epoch, score, writer)
+            train(model, reader, optimizer, config, local_rank, epoch, loss, writer)
         else:
-            train(model, reader, optimizer, config, local_rank, epoch, score)
+            train(model, reader, optimizer, config, local_rank, epoch, loss)
         
         end = time.time()
         global_epoch = epoch
         logger.info("epoch: {}, {:.4f} secs".format(epoch+1, end-start))
 
         logger.info("Validate...")
-        score = validate(model, reader, config, local_rank)
-        logger.info("BLEU: {:.4f}".format(score))
+        loss = validate(model, reader, config, local_rank)
+        logger.info("Loss: {:.4f}".format(loss))
         
         if local_rank == 0:
-            writer.add_scalar("Val/BLEU", score, epoch+1)
+            writer.add_scalar("Val/Loss", loss, epoch+1)
 
-        if score > max_score:  # save model
+        if loss < min_loss:  # save model
             if local_rank == 0:
-                save(model, optimizer, save_path, config, train.global_step, epoch, score)
+                save(model, optimizer, save_path, config, train.global_step, epoch, loss)
                 logger.info("Saved to {}.".format(os.path.abspath(save_path)))
             
-            max_score = score
+            min_loss = loss
             early_stop_count = config.early_stop_count
         else:  # ealry stopping
             if early_stop_count == 0:
@@ -148,7 +148,7 @@ def init_process(local_rank, backend, config):
             logger.info("early stop count: {}".format(early_stop_count))
     logger.info("Training finished.")
 
-def train(model, reader, optimizer, config, local_rank, global_epoch, max_score, writer=None):
+def train(model, reader, optimizer, config, local_rank, global_epoch, min_loss, writer=None):
     iterator = reader.make_batch("train")
 
     if local_rank == 0:  # only one process prints something
@@ -169,9 +169,9 @@ def train(model, reader, optimizer, config, local_rank, global_epoch, max_score,
 
             model.zero_grad()
             pad_mask = (inputs != reader.pad_idx).cuda()
-            labels.masked_fill_(pad_mask, value=-100)
+            labels.masked_fill_(~pad_mask, value=-100)
             pred = model(inputs, attention_mask=pad_mask)[0]
-            loss = F.cross_entropy(pred.view(-1, config.vocab_size), labels.view(-1), ignore_index=-100)
+            loss = F.cross_entropy(pred.view(-1, config.vocab_size), labels.contiguous().view(-1), ignore_index=-100)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10)
             optimizer.step()
@@ -190,19 +190,76 @@ def train(model, reader, optimizer, config, local_rank, global_epoch, max_score,
             print("batch size: {}, length: {}".format(batch_size, length))
             error_save_path = "save/model_error_{}.pt".format(re.sub("\s+", "_", time.asctime()))
             print("model saved to {}".format(error_save_path))
-            save(model, optimizer, error_save_path, train.step, global_epoch, max_score)
+            save(model, optimizer, error_save_path, train.step, global_epoch, min_loss)
             exit(0)
 
         except KeyboardInterrupt as e:
             print(e)
             stop_save_path = "save/model_stop_{}.pt".format(re.sub("\s+", "_", time.asctime()))
             print("model saved to {}".format(stop_save_path))
-            save(model, optimizer, stop_save_path, train.step, global_epoch, max_score)
+            save(model, optimizer, stop_save_path, train.step, global_epoch, min_loss)
             exit(0)
+
+# def validate(model, reader, config, local_rank):
+#     model.eval()
+#     bleu = 0
+#     batch_count = 0
+#     bleu_smoothing = bleu_score.SmoothingFunction().method7
+#     with torch.no_grad():
+#         iterator = reader.make_batch("dev")
+
+#         if local_rank == 0:
+#             t = tqdm(enumerate(iterator), total=validate.max_iter, ncols=150, position=0, leave=True)
+#         else:
+#             t = enumerate(iterator)
+
+#         for batch_idx, batch in t:
+#             inputs, labels = reader.make_input(batch)
+#             batch_size = inputs.size(0)
+#             length = inputs.size(1)
+#             words = []
+#             eos_batches = [False for i in range(batch_size)]
+#             end_batches = [True for i in range(batch_size)]
+#             for word_count in range(config.max_length):
+#                 pad_mask = (inputs != reader.pad_idx).cuda()
+#                 outputs = model(inputs, attention_mask=pad_mask)
+#                 pred = outputs[0][:, -1, :].detach()
+#                 word = pred.argmax(dim=-1)
+#                 words.append(word)
+#                 word = word.tolist()
+#                 new_inputs = torch.ones(batch_size, min(inputs.size(1)+1, config.max_length), dtype=torch.int64).cuda() * config.pad_idx
+#                 for b_idx in range(batch_size):
+#                     if eos_batches[b_idx]:
+#                         continue
+#                     b_input = inputs[b_idx][inputs[b_idx] != reader.pad_idx].tolist()
+#                     b_input.append(word[b_idx])
+#                     b_input = b_input[-config.max_length:]
+#                     if word[b_idx] == reader.eos_idx:
+#                         eos_batches[b_idx] = True
+#                     new_inputs[b_idx, :len(b_input)] = torch.tensor(b_input, dtype=torch.int64)
+#                 inputs = new_inputs
+#                 del new_inputs, outputs
+#                 if eos_batches == end_batches:
+#                     break
+#             words = torch.stack(words, dim=1).tolist()
+#             for b_idx in range(batch_size):
+#                 label = labels[b_idx]
+#                 label[label != config.pad_idx].tolist()
+#                 bleu += bleu_score.sentence_bleu([label[label != config.pad_idx].tolist()], words[b_idx], smoothing_function=bleu_smoothing)
+#             batch_count += batch_size
+
+#             if local_rank == 0:
+#                 t.set_description("iter: {}".format(batch_idx+1))
+#                 time.sleep(1)
+#             torch.cuda.empty_cache()
+#     model.train()
+#     bleu = bleu / batch_count
+
+#     return bleu
 
 def validate(model, reader, config, local_rank):
     model.eval()
-    bleu_score = 0
+    loss = 0
     batch_count = 0
     with torch.no_grad():
         iterator = reader.make_batch("dev")
@@ -215,36 +272,12 @@ def validate(model, reader, config, local_rank):
         for batch_idx, batch in t:
             inputs, labels = reader.make_input(batch)
             batch_size = inputs.size(0)
-            length = inputs.size(1)
-            words = []
-            eos_batches = [False for i in range(batch_size)]
-            end_batches = [True for i in range(batch_size)]
-            for word_count in range(config.max_length):
-                pad_mask = (inputs != reader.pad_idx).cuda()
-                outputs = model(inputs, attention_mask=pad_mask)
-                pred = outputs[0][:, -1, :].detach()
-                word = pred.argmax(dim=-1)
-                words.append(word)
-                word = word.tolist()
-                new_inputs = torch.ones(batch_size, min(inputs.size(1)+1, config.max_length), dtype=torch.int64).cuda() * config.pad_idx
-                for b_idx in range(batch_size):
-                    if eos_batches[b_idx]:
-                        continue
-                    b_input = inputs[b_idx][inputs[b_idx] != reader.pad_idx].tolist()
-                    b_input.append(word[b_idx])
-                    b_input = b_input[-config.max_length:]
-                    if word[b_idx] == reader.eos_idx:
-                        eos_batches[b_idx] = True
-                    new_inputs[b_idx, :len(b_input)] = torch.tensor(b_input, dtype=torch.int64)
-                inputs = new_inputs
-                del new_inputs, outputs
-                if eos_batches == end_batches:
-                    break
-            words = torch.stack(words, dim=1).tolist()
-            for b_idx in range(batch_size):
-                label = labels[b_idx]
-                label[label != config.pad_idx].tolist()
-                bleu_score += bleu_score.sentence_bleu([label[label != config.pad_idx].tolist()], words[b_idx])
+
+            model.zero_grad()
+            pad_mask = (inputs != reader.pad_idx).cuda()
+            labels.masked_fill_(~pad_mask, value=-100)
+            pred = model(inputs, attention_mask=pad_mask)[0]
+            loss += F.cross_entropy(pred.view(-1, config.vocab_size), labels.contiguous().view(-1), ignore_index=-100).item() * batch_size
             batch_count += batch_size
 
             if local_rank == 0:
@@ -252,25 +285,25 @@ def validate(model, reader, config, local_rank):
                 time.sleep(1)
             torch.cuda.empty_cache()
     model.train()
-    bleu_score = bleu_score / batch_count
+    loss = loss / batch_count
 
-    return bleu_score
+    return loss
 
-def save(model, optimizer, save_path, step, epoch, score):
+def save(model, optimizer, save_path, step, epoch, loss):
     checkpoint = {
         "model": model.module.state_dict(),
         "optimizer": optimizer.state_dict(),
         "step": step,
         "epoch": epoch,
-        "score": score
+        "loss": loss
     }
     torch.save(checkpoint, save_path)
 
 def load(model, optimizer, save_path, local_rank, config):
     checkpoint = torch.load(save_path, map_location = lambda storage, loc: storage.cuda(local_rank))
-    model.load_state_dict(checkpoint["model"])
+    model.module.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
-    return checkpoint["step"], checkpoint["epoch"], checkpoint["score"]
+    return checkpoint["step"], checkpoint["epoch"], checkpoint["loss"]
 
 if __name__ == "__main__":
     os.environ["KMP_WARNINGS"] = "0"

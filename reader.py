@@ -53,7 +53,7 @@ class Reader:
         labels = torch.ones(batch_size, self.max_length, dtype=torch.int64).cuda() * self.pad_idx
         max_length = 0
         for batch_idx in range(batch_size):
-            tokens = self.tokenizer.EncodeAsIds(batch[batch_idx])
+            tokens = self.tokenizer.EncodeAsIds(batch[batch_idx])[:self.max_length]
             length = len(tokens)
             inputs[batch_idx, :length] = torch.tensor(tokens, dtype=torch.int64)
             labels[batch_idx, :length] = torch.tensor(tokens[1:] + [self.eos_idx], dtype=torch.int64)

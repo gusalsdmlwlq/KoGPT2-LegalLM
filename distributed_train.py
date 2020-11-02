@@ -108,9 +108,9 @@ def init_process(local_rank, backend, config):
         start = time.time()
 
         if local_rank == 0:
-            train(model, reader, optimizer, config, local_rank, epoch, loss, writer)
+            train(model, reader, optimizer, config, local_rank, epoch, min_loss, writer)
         else:
-            train(model, reader, optimizer, config, local_rank, epoch, loss)
+            train(model, reader, optimizer, config, local_rank, epoch, min_loss)
         
         end = time.time()
         global_epoch = epoch
@@ -125,7 +125,7 @@ def init_process(local_rank, backend, config):
 
         if loss < min_loss:  # save model
             if local_rank == 0:
-                save(model, optimizer, save_path, config, train.global_step, epoch, loss)
+                save(model, optimizer, save_path, train.global_step, epoch, loss)
                 logger.info("Saved to {}.".format(os.path.abspath(save_path)))
             
             min_loss = loss
@@ -190,14 +190,14 @@ def train(model, reader, optimizer, config, local_rank, global_epoch, min_loss, 
             print("batch size: {}, length: {}".format(batch_size, length))
             error_save_path = "save/model_error_{}.pt".format(re.sub("\s+", "_", time.asctime()))
             print("model saved to {}".format(error_save_path))
-            save(model, optimizer, error_save_path, train.step, global_epoch, min_loss)
+            save(model, optimizer, error_save_path, train.global_step, global_epoch, min_loss)
             exit(0)
 
         except KeyboardInterrupt as e:
             print(e)
             stop_save_path = "save/model_stop_{}.pt".format(re.sub("\s+", "_", time.asctime()))
             print("model saved to {}".format(stop_save_path))
-            save(model, optimizer, stop_save_path, train.step, global_epoch, min_loss)
+            save(model, optimizer, stop_save_path, train.global_step, global_epoch, min_loss)
             exit(0)
 
 # def validate(model, reader, config, local_rank):
